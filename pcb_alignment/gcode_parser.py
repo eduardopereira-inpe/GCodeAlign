@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 import re
+from typing import Callable
 
 
 _WORD_RE = re.compile(
@@ -12,6 +13,7 @@ _WORD_RE = re.compile(
 )
 _INCOMPLETE_GEOMETRY_RE = re.compile(r"([XYIJ])\s*(?=$|[A-Za-z])", re.IGNORECASE)
 _SUPPORTED_MOTIONS = {0, 1, 2, 3}
+ProgressCallback = Callable[[int, int], None]
 
 
 @dataclass(frozen=True)
@@ -99,7 +101,9 @@ def _one_word_value(words: tuple[Word, ...], letter: str) -> float | None:
     return matches[-1].value if matches else None
 
 
-def parse_gcode(text: str) -> ParsedProgram:
+def parse_gcode(
+    text: str, progress: ProgressCallback | None = None
+) -> ParsedProgram:
     """Parse motions and identify constructs that cannot be safely transformed."""
     if not text.strip():
         raise ValueError("The G-code file is empty.")
@@ -117,8 +121,14 @@ def parse_gcode(text: str) -> ParsedProgram:
     motions: list[Motion] = []
     issues: list[Issue] = []
     saw_motion = False
+    total_lines = len(lines)
+    progress_interval = max(1, total_lines // 100)
 
     for line_number, line in enumerate(lines, start=1):
+        if progress is not None and (
+            line_number == 1 or line_number == total_lines or line_number % progress_interval == 0
+        ):
+            progress(line_number, total_lines)
         words = words_in_line(line)
         g_values = [_code_number(word) for word in words if word.letter == "G"]
         active_code = _active_code(line)

@@ -6,7 +6,7 @@ import math
 from pathlib import Path
 
 from .alignment import rotate_point
-from .gcode_parser import ParsedProgram, words_in_line, parse_gcode
+from .gcode_parser import ParsedProgram, ProgressCallback, words_in_line, parse_gcode
 
 
 class TransformError(ValueError):
@@ -53,7 +53,11 @@ def _set_words(
     return line
 
 
-def transform_gcode(parsed: ParsedProgram, angle_radians: float) -> str:
+def transform_gcode(
+    parsed: ParsedProgram,
+    angle_radians: float,
+    progress: ProgressCallback | None = None,
+) -> str:
     """Rotate all supported XY moves after a successful safety analysis."""
     if not math.isfinite(angle_radians):
         raise TransformError("The rotation angle must be a finite number.")
@@ -68,8 +72,14 @@ def transform_gcode(parsed: ParsedProgram, angle_radians: float) -> str:
     unit_scale = 1.0
     absolute = True
     modal_motion: int | None = None
+    total_lines = len(parsed.lines)
+    progress_interval = max(1, total_lines // 100)
 
-    for line in parsed.lines:
+    for line_number, line in enumerate(parsed.lines, start=1):
+        if progress is not None and (
+            line_number == 1 or line_number == total_lines or line_number % progress_interval == 0
+        ):
+            progress(line_number, total_lines)
         words = words_in_line(line)
         g_values = [round(word.value, 6) for word in words if word.letter == "G"]
         if 20.0 in g_values:

@@ -383,6 +383,38 @@ Não assumir que todas as linhas do G-code contêm coordenadas XY.
 Preservar linhas que não necessitam de transformação.
 
 ---
+### Processamento assíncrono e responsividade da interface (GUI)
+
+A aplicação deverá ser projetada para manter a interface gráfica responsiva durante todas as operações que envolvam processamento potencialmente demorado, especialmente a leitura, interpretação, transformação e renderização de arquivos G-code.
+
+O carregamento de arquivos maiores, a análise das trajetórias, o cálculo da transformação geométrica e a atualização da visualização gráfica não deverão bloquear a thread principal da interface (Main Thread).
+
+**Requisitos:**
+
+- Implementar processamento em background utilizando threading ou multiprocessing, conforme apropriado.
+- A thread principal deverá ser responsável exclusivamente pela interface gráfica e pelos eventos do usuário.
+- Operações de leitura, parsing e transformação de G-code deverão ser executadas fora da thread principal.
+- A renderização e atualização do Matplotlib deverão respeitar as restrições de thread do Tkinter, sendo realizadas na thread principal, mas de forma controlada, evitando atualizações excessivas que provoquem congelamentos.
+- Utilizar mecanismos seguros de comunicação entre threads, como `queue.Queue`, para transmitir resultados, status, mensagens de erro e progresso para a interface.
+- Utilizar mecanismos de atualização periódica da interface, como `after()` do Tkinter, para consultar o estado das tarefas em background e atualizar os componentes gráficos sem bloquear o event loop.
+- Sempre que possível, disponibilizar indicação visual de processamento, como barra de progresso indeterminada ou percentual de progresso, além de mensagens de status como "Carregando G-code", "Analisando trajetórias", "Aplicando transformação" e "Atualizando visualização".
+- Evitar renderizações completas e repetitivas do gráfico durante o processamento. A visualização deverá ser atualizada somente quando necessário, preferencialmente após a conclusão da análise ou transformação.
+- Prevenir operações concorrentes conflitantes, evitando que múltiplos carregamentos ou transformações simultâneas comprometam o estado da aplicação. Se uma nova operação for iniciada, a anterior deverá ser cancelada, invalidada ou devidamente gerenciada.
+- Permitir que o usuário continue interagindo com a interface durante o processamento, incluindo acesso a controles que não comprometam a integridade da operação em andamento.
+- Implementar tratamento de exceções no background, garantindo que erros sejam retornados à interface e não causem encerramento inesperado da aplicação.
+
+**Diretrizes de implementação:**
+
+Preferencialmente, utilizar `threading` para operações de I/O e processamento de G-code, reservando `multiprocessing` para situações em que o processamento computacional seja suficientemente pesado para justificar sua utilização. Não utilizar multiprocessing desnecessariamente, pois isso adiciona complexidade ao gerenciamento de processos, comunicação e estado da aplicação.
+
+No caso do Tkinter, nenhuma thread secundária deverá manipular diretamente widgets ou executar operações de atualização da interface. Toda atualização de elementos gráficos deverá ser coordenada pela thread principal.
+
+A arquitetura deverá separar claramente o processamento do G-code, a lógica geométrica, a comunicação das tarefas em background e a interface gráfica.
+
+**Critério de aceitação:**
+
+A aplicação deverá carregar, analisar, transformar e visualizar arquivos G-code significativamente maiores que os arquivos utilizados nos testes iniciais, sem congelamento da interface, sem perda de interatividade, sem comprometer a integridade do G-code e sem provocar consumo desnecessário de memória. O comportamento deverá ser validado utilizando arquivos maiores e trajetórias com elevado número de segmentos.
+---
 
 ## 11. Testes
 

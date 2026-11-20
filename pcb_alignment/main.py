@@ -8,9 +8,12 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from .alignment import AlignmentError, calculate_correction_angle, degrees
-from .gcode_parser import ParsedProgram, parse_gcode
-from .gcode_transform import TransformError, default_output_name, transform_gcode, validate_output_path
+from .background import BackgroundTasks, TaskMessage, drain_latest
+from .gcode_parser import ParsedProgram
+from .gcode_transform import default_output_name
 from .gcode_viewer import GCodeViewer
+from .jobs import LoadResult, SaveResult, TransformResult, load_gcode, save_gcode, transform_program
+from .trajectory import TrajectoryData
 
 
 class PCBAlignmentApp(tk.Tk):
@@ -24,7 +27,12 @@ class PCBAlignmentApp(tk.Tk):
         self.parsed_program: ParsedProgram | None = None
         self.angle_radians: float | None = None
         self.transformed_text: str | None = None
+        self._original_trajectory: TrajectoryData | None = None
         self._update_job: str | None = None
+        self._poll_job: str | None = None
+        self._active_task_id: int | None = None
+        self._active_task_kind: str | None = None
+        self.tasks = BackgroundTasks()
 
         self.axis_var = tk.StringVar(value="X")
         self.measured_x_var = tk.StringVar()
@@ -52,7 +60,8 @@ class PCBAlignmentApp(tk.Tk):
         input_frame = ttk.LabelFrame(left, text="Arquivo de entrada", padding=8)
         input_frame.pack(fill="x", pady=(0, 8))
         ttk.Label(input_frame, textvariable=self.input_name_var, wraplength=320).pack(anchor="w", fill="x")
-        ttk.Button(input_frame, text="Abrir G-code…", command=self.open_file).pack(fill="x", pady=(8, 0))
+        self.open_button = ttk.Button(input_frame, text="Abrir G-code…", command=self.open_file)
+        self.open_button.pack(fill="x", pady=(8, 0))
 
         alignment_frame = ttk.LabelFrame(left, text="Configuração do alinhamento", padding=8)
         alignment_frame.pack(fill="x", pady=(0, 8))
@@ -64,7 +73,8 @@ class PCBAlignmentApp(tk.Tk):
         ttk.Entry(alignment_frame, textvariable=self.measured_x_var).grid(row=3, column=0, sticky="ew", padx=(0, 4))
         ttk.Entry(alignment_frame, textvariable=self.measured_y_var).grid(row=3, column=1, sticky="ew")
         ttk.Label(alignment_frame, text="A origem permanece fixa em X0 Y0.").grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        ttk.Button(alignment_frame, text="Atualizar transformação", command=self.update_alignment).grid(row=5, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self.transform_button = ttk.Button(alignment_frame, text="Atualizar transformação", command=self.update_alignment)
+        self.transform_button.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         alignment_frame.columnconfigure(0, weight=1)
         alignment_frame.columnconfigure(1, weight=1)
 
@@ -83,11 +93,15 @@ class PCBAlignmentApp(tk.Tk):
         output_frame = ttk.LabelFrame(left, text="Arquivo de saída", padding=8)
         output_frame.pack(fill="x", pady=(0, 8))
         ttk.Entry(output_frame, textvariable=self.output_name_var).pack(fill="x")
-        ttk.Button(output_frame, text="Salvar G-code transformado…", command=self.save_transformed).pack(fill="x", pady=(8, 0))
+        self.save_button = ttk.Button(output_frame, text="Salvar G-code transformado…", command=self.save_transformed)
+        self.save_button.pack(fill="x", pady=(8, 0))
 
         status_frame = ttk.LabelFrame(left, text="Status / validação", padding=8)
         status_frame.pack(fill="both", expand=True)
-        ttk.Label(status_frame, textvariable=self.status_var, wraplength=320, justify="left").pack(anchor="nw", fill="both", expand=True)
+        ttk.Label(status_frame, textvariable=self.status_var, wraplength=320, justify="left").pack(anchor="nw", fill="x")
+        self.progress = ttk.Progressbar(status_frame, mode="indeterminate", maximum=100)
+        self.progress.pack(fill="x", pady=(8, 0))
+        self.progress.pack_forget()
 
         self.viewer = GCodeViewer(right)
         self.viewer.pack(fill="both", expand=True)
@@ -107,25 +121,18 @@ class PCBAlignmentApp(tk.Tk):
         )
         if not filename:
             return
-        try:
-            path = Path(filename)
-            text = path.read_text(encoding="utf-8-sig")
-            parsed = parse_gcode(text)
-        except (OSError, UnicodeError, ValueError) as error:
-            messagebox.showerror("Não foi possível abrir o arquivo", str(error), parent=self)
-            return
-
+        path = Path(filename)
         self.input_path = path
-        self.parsed_program = parsed
+        self.parsed_program = None
+        self._original_trajectory = None
         self.angle_radians = None
         self.transformed_text = None
-        self.point_info_var.set("—")
-        self.angle_info_var.set("—")
         self.input_name_var.set(path.name)
         self.output_name_var.set(default_output_name(path))
-        self.viewer.set_programs(parsed, None)
-        self._set_analysis_status(parsed)
-        self.update_alignment()
+        self.point_info_var.set("—")
+        self.angle_info_var.set("—")
+        self.viewer.set_plot_data(None, None)
+        self._start_task("load", lambda report: load_gcode(path, report))
 
     def _set_analysis_status(self, program: ParsedProgram) -> None:
         if program.blocking_issues:
@@ -137,13 +144,106 @@ class PCBAlignmentApp(tk.Tk):
         else:
             self.status_var.set("Arquivo válido para visualização e transformação segura.")
 
+    def _start_task(self, kind: str, operation) -> None:
+        if self._poll_job is not None:
+            self.after_cancel(self._poll_job)
+            self._poll_job = None
+        self._active_task_kind = kind
+        self._active_task_id = self.tasks.submit(kind, operation)
+        self._set_processing(True)
+        self.status_var.set({
+            "load": "Carregando G-code…",
+            "transform": "Aplicando transformação…",
+            "save": "Salvando G-code…",
+        }.get(kind, "Processando…"))
+        self._poll_job = self.after(50, self._poll_tasks)
+
+    def _set_processing(self, processing: bool) -> None:
+        self.transform_button.state(["disabled" if processing else "!disabled"])
+        self.save_button.state(["disabled" if processing or self.transformed_text is None else "!disabled"])
+        if processing:
+            if not self.progress.winfo_ismapped():
+                self.progress.pack(fill="x", pady=(8, 0))
+            self.progress.configure(mode="indeterminate", value=0)
+            self.progress.start(12)
+        else:
+            self.progress.stop()
+            self.progress.pack_forget()
+
+    def _poll_tasks(self) -> None:
+        self._poll_job = None
+        messages = drain_latest(self.tasks.messages)
+        for message in messages:
+            if message.task_id != self._active_task_id:
+                continue
+            if message.phase == "progress":
+                self.status_var.set(message.status)
+                if message.progress is not None:
+                    self.progress.stop()
+                    self.progress.configure(mode="determinate", value=message.progress * 100)
+                else:
+                    self.progress.configure(mode="indeterminate")
+                    self.progress.start(12)
+            elif message.phase == "error":
+                self._finish_task()
+                self.status_var.set(message.status or "Falha durante o processamento.")
+            elif message.phase == "result":
+                self._handle_result(message)
+        if self._active_task_id is not None:
+            self._poll_job = self.after(75, self._poll_tasks)
+
+    def _finish_task(self) -> None:
+        self._active_task_id = None
+        self._active_task_kind = None
+        if self._poll_job is not None:
+            self.after_cancel(self._poll_job)
+            self._poll_job = None
+        self._set_processing(False)
+
+    def _handle_result(self, message: TaskMessage) -> None:
+        self.status_var.set("Atualizando visualização…")
+        if message.kind == "load" and isinstance(message.result, LoadResult):
+            result = message.result
+            self.after_idle(lambda: self._render_loaded(result, message.task_id))
+        elif message.kind == "transform" and isinstance(message.result, TransformResult):
+            result = message.result
+            self.after_idle(lambda: self._render_transformed(result, message.task_id))
+        elif message.kind == "save" and isinstance(message.result, SaveResult):
+            self._finish_task()
+            self.status_var.set(f"Arquivo salvo com segurança em: {message.result.path}")
+
+    def _render_loaded(self, result: LoadResult, task_id: int) -> None:
+        if self._active_task_id != task_id or self._active_task_kind != "load":
+            return
+        self.input_path = result.path
+        self.parsed_program = result.parsed
+        self._original_trajectory = result.trajectory
+        self.viewer.set_plot_data(result.trajectory, None)
+        self._finish_task()
+        self._set_analysis_status(result.parsed)
+        if result.parsed.can_transform and self.measured_x_var.get().strip() and self.measured_y_var.get().strip():
+            self._schedule_update()
+
+    def _render_transformed(self, result: TransformResult, task_id: int) -> None:
+        if self._active_task_id != task_id or self._active_task_kind != "transform":
+            return
+        self.viewer.set_plot_data(self._original_trajectory, result.trajectory)
+        self.angle_radians = result.angle
+        self.transformed_text = result.text
+        self.point_info_var.set(f"({result.measured_x:g}, {result.measured_y:g}) mm")
+        self.angle_info_var.set(f"{degrees(result.angle):+.8f}°")
+        self._finish_task()
+        self.status_var.set("Transformação calculada. Revise a visualização antes de salvar.")
+
     def update_alignment(self) -> None:
         self._update_job = None
         self.axis_info_var.set(self.axis_var.get())
         self.angle_radians = None
         self.transformed_text = None
+        self.save_button.state(["disabled"])
         if self.parsed_program is None:
-            self.status_var.set("Carregue um arquivo G-code para começar.")
+            if self._active_task_kind != "load":
+                self.status_var.set("Carregue um arquivo G-code para começar.")
             self.viewer.set_transformed(None)
             return
         if self.parsed_program.blocking_issues:
@@ -159,22 +259,23 @@ class PCBAlignmentApp(tk.Tk):
             y = float(y_text)
             if not math.isfinite(x) or not math.isfinite(y):
                 raise AlignmentError("As coordenadas devem ser números finitos.")
-            angle = calculate_correction_angle(x, y, self.axis_var.get())
-            transformed_text = transform_gcode(self.parsed_program, angle)
-            transformed = parse_gcode(transformed_text)
-        except (ValueError, TransformError) as error:
+            axis = self.axis_var.get()
+            angle = calculate_correction_angle(x, y, axis)
+        except (ValueError, AlignmentError) as error:
             self.angle_info_var.set("—")
             self.point_info_var.set("—")
             self.status_var.set(str(error))
             self.viewer.set_transformed(None)
             return
 
-        self.angle_radians = angle
-        self.transformed_text = transformed_text
-        self.point_info_var.set(f"({x:g}, {y:g}) mm")
-        self.angle_info_var.set(f"{degrees(angle):+.8f}°")
-        self.status_var.set("Transformação calculada. Revise a visualização antes de salvar.")
-        self.viewer.set_transformed(transformed)
+        self.angle_info_var.set("—")
+        self.point_info_var.set("—")
+        self.viewer.set_transformed(None)
+        parsed = self.parsed_program
+        self._start_task(
+            "transform",
+            lambda report: transform_program(parsed, angle, x, y, report),
+        )
 
     def save_transformed(self) -> None:
         if self.transformed_text is None or self.input_path is None:
@@ -195,22 +296,25 @@ class PCBAlignmentApp(tk.Tk):
         if not filename:
             return
         target = Path(filename)
-        try:
-            target = validate_output_path(self.input_path, target)
-            if target.exists() and not messagebox.askyesno(
-                "Substituir arquivo?",
-                f"O arquivo {target.name} já existe. Deseja substituí-lo?",
-                parent=self,
-            ):
-                return
-            target.write_text(self.transformed_text, encoding="utf-8")
-            parse_gcode(target.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, ValueError) as error:
-            messagebox.showerror("Falha ao salvar", str(error), parent=self)
+        if target.exists() and not messagebox.askyesno(
+            "Substituir arquivo?",
+            f"O arquivo {target.name} já existe. Deseja substituí-lo?",
+            parent=self,
+        ):
             return
-        self.status_var.set(f"Arquivo salvo com segurança em: {target}")
+        source = self.input_path
+        text = self.transformed_text
+        self._start_task(
+            "save",
+            lambda report: save_gcode(source, target, text, report),
+        )
 
     def _close(self) -> None:
+        if self._update_job is not None:
+            self.after_cancel(self._update_job)
+        if self._poll_job is not None:
+            self.after_cancel(self._poll_job)
+        self.tasks.shutdown()
         self.destroy()
 
 

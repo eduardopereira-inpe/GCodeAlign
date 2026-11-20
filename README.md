@@ -10,6 +10,15 @@ Aplicação desktop local para corrigir exclusivamente a rotação 2D de trajet�
 
 ## Instalação
 
+Após a publicação no PyPI, a aplicação poderá ser instalada com:
+
+```bash
+python -m pip install pcb-gcode-align
+gcodealign
+```
+
+Para desenvolvimento local, crie um ambiente virtual:
+
 ```bash
 python -m venv .venv
 ```
@@ -42,6 +51,18 @@ Também é possível usar:
 python -m pcb_alignment.main
 ```
 
+Em uma instalação a partir do pacote, use o executável `gcodealign`.
+
+## Empacotamento para PyPI
+
+```bash
+python -m pip install -e ".[dev]"
+python -m build
+python -m twine check dist/*
+```
+
+A publicação é um passo separado e requer credenciais do índice de destino.
+
 ## Fluxo de uso
 
 1. Carregue um arquivo `.gcode`, `.nc` ou `.tap`.
@@ -72,6 +93,8 @@ As coordenadas permanecem na unidade ativa de cada bloco. Internamente, a análi
 ## Visualização
 
 A visualização mostra G0, G1 e arcos da trajetória original e, após informar a referência, a trajetória transformada. A barra de navegação oferece pan, zoom e retorno à vista inicial; o botão **Ajustar à vista** recalcula os limites com proporção geométrica igual.
+
+Leitura, análise, transformação, validação e gravação são executadas por um worker em background. A fila de mensagens mantém Tkinter e Matplotlib restritos à thread principal, enquanto barra de progresso e status são atualizados por `after()`. Novos parâmetros invalidam resultados anteriores, evitando que uma transformação obsoleta substitua o estado visível. Para reduzir o custo de arquivos grandes, os movimentos são preparados em trajetórias agregadas, em vez de criar um objeto gráfico por segmento.
 
 ## Testes
 
